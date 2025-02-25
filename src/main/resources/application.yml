@@ -1,0 +1,24 @@
+server:
+  port: 8084
+
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/capstone
+    username: capstone
+    password: MyCapstonePassword
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: "background"
+      auto-offset-reset: latest
+
+app:
+  kafka:
+    topics:
+      update: "jfc-bg"
+      ack: "ack-topic"
+
