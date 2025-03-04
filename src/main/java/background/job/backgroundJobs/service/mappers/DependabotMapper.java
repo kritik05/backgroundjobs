@@ -54,4 +54,29 @@ public class DependabotMapper {
                 return Severity.INFO;
         }
     }
+    public String dismissedReason(String state) {
+        switch (state) {
+            case "SUPPRESSED":
+                return "fix_started";
+            case "FALSE_POSITIVE":
+                return "inaccurate";
+            case "FIXED":
+                return "fixed";
+            default:
+                return "false positive";
+        }
+    }
+
+    public String dismissedState(String state) {
+        switch (state) {
+            case "SUPPRESSED":
+            case "FALSE_POSITIVE":
+            case "FIXED":
+                return "dismissed";
+            case "OPEN":
+                return "open";
+            default:
+                return "false positive";
+        }
+    }
 }

@@ -118,20 +118,16 @@ public class JiraService {
                         + " using transition ID " + transitionId
                         + ". Status: " + postResponse.getStatusCode());
             }
-
-            // We repeat until there are no more transitions (which presumably means "Done")
         }
     }
 
 
-    // Helper method to fetch Tenant or throw if not found
     private Tenant getTenantOrThrow(int tenantId) {
         Optional<Tenant> opt = tenantRepository.findById(tenantId);
         return opt.orElseThrow(() ->
                 new RuntimeException("Tenant not found with ID: " + tenantId));
     }
 
-    // Helper method to build Basic Auth headers
     private HttpHeaders buildAuthHeaders(String username, String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

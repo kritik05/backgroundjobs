@@ -1,18 +1,15 @@
 package background.job.backgroundJobs.consumer;
 
-import background.job.backgroundJobs.event.AcknowledgementEvent;
-import background.job.backgroundJobs.event.TicketCreateRequestEvent;
-import background.job.backgroundJobs.event.TicketTransitionRequestEvent;
-import background.job.backgroundJobs.event.UpdateRequestEvent;
-import background.job.backgroundJobs.model.AcknowledgementPayload;
-import background.job.backgroundJobs.model.StateRequest;
-import background.job.backgroundJobs.model.Tenant;
-import background.job.backgroundJobs.model.TenantTicket;
+import background.job.backgroundJobs.event.*;
+import background.job.backgroundJobs.model.*;
+import background.job.backgroundJobs.repository.RunbookRepository;
+import background.job.backgroundJobs.repository.RunbookRuleRepository;
 import background.job.backgroundJobs.repository.TenantRepository;
 import background.job.backgroundJobs.repository.TenantTicketRepository;
 import background.job.backgroundJobs.service.ElasticsearchService;
 import background.job.backgroundJobs.service.GithubService;
 import background.job.backgroundJobs.service.JiraService;
+import background.job.backgroundJobs.service.RunbookActionService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -20,9 +17,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
-
-import java.io.IOException;
-import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.*;
 
 @Component
 public class BgConsumer {
@@ -33,11 +29,14 @@ public class BgConsumer {
     private final ObjectMapper objectMapper;
     private final TenantTicketRepository tenantTicketRepository;
     private final JiraService jiraService;
+    private final RunbookRepository runbookRepository;
+    private final RunbookRuleRepository runbookRuleRepository;
+    private final RunbookActionService runbookActionService;
 
     @Value("${app.kafka.topics.ack}")
     private String ackTopic;
 
-    public BgConsumer(ElasticsearchService elasticsearchService, TenantRepository tenantRepository, KafkaTemplate<String, Object> ackTemplate, GithubService githubService, ObjectMapper objectMapper, TenantTicketRepository tenantTicketRepository, JiraService jiraService) {
+    public BgConsumer(ElasticsearchService elasticsearchService, TenantRepository tenantRepository, KafkaTemplate<String, Object> ackTemplate, GithubService githubService, ObjectMapper objectMapper, TenantTicketRepository tenantTicketRepository, JiraService jiraService,RunbookRepository runbookRepository,RunbookRuleRepository runbookRuleRepository,RunbookActionService runbookActionService) {
         this.githubService=githubService;
         this.elasticsearchService = elasticsearchService;
         this.tenantRepository=tenantRepository;
@@ -45,38 +44,148 @@ public class BgConsumer {
         this.objectMapper=objectMapper;
         this.tenantTicketRepository=tenantTicketRepository;
         this.jiraService=jiraService;
+        this.runbookRepository=runbookRepository;
+        this.runbookRuleRepository=runbookRuleRepository;
+        this.runbookActionService=runbookActionService;
     }
 
-//    @KafkaListener(
-//            topics = "${app.kafka.topics.update}",
-//            groupId = "${spring.kafka.consumer.group-id}",
-//            containerFactory = "updateRequestEventListenerContainerFactory"
-//    )
     @KafkaListener(
             topics = "#{'${app.kafka.topics.update}'}", // e.g. "jfc.jobs"
             groupId = "jfc-ingestion-consumer",
             containerFactory = "unifiedListenerContainerFactory"
     )
     public void onMessage(String message) throws Exception {
-        // 1) Read the raw JSON
-        System.out.println(message);
         JsonNode root = objectMapper.readTree(message);
-        // 2) Check for the "type" field
         String typeString = root.get("type").asText();
-        // 3) Based on event type, deserialize into the correct DTO
         switch (typeString) {
             case "update":consumeUpdateRequestEvent(message);
                 break;
             case "ticketCreate":consumeTicketCreateRequest(message);
                 break;
             case "ticketTransition":consumeTransitionRequest(message);
+            case "runbook":consumeRunbookRequest(message);
                 break;
             default : {
-                // ignore or log error
                 System.out.println("Unknown event type:");
             }
         }
     }
+
+    private void consumeRunbookRequest(String message) throws JsonProcessingException {
+        RunbookRequestEvent event= objectMapper.readValue(message, RunbookRequestEvent.class);
+        String originalEventId = event.getEventId();
+        try{
+            System.out.println("Runbook request received");
+            RunbookPayload payload = event.getPayload();
+            Integer tenantId = payload.getTenantId();
+            String trigger = payload.getTriggerType();
+            List<String> findingIds = payload.getFindingIds();
+            List<Runbook> tenantRunbooks = runbookRepository.findByTenantIdAndIsEnabledTrue(Long.valueOf(tenantId));
+            if (tenantRunbooks.isEmpty()) {
+                System.out.println("No enabled runbooks for tenant " + tenantId);
+                sendAck(originalEventId, "SUCCESS");
+                return;
+            }
+
+            List<RunbookRule> allRules = runbookRuleRepository.findByRunbookInAndIsEnabledTrue(tenantRunbooks);
+            if (allRules.isEmpty()) {
+                System.out.println("No rules found for these runbooks");
+                sendAck(originalEventId, "SUCCESS");
+            }
+            for (RunbookRule rule : allRules) {
+                if (!rule.matchesTrigger(trigger)) {
+                    continue;
+                }
+                System.out.println("Matching rule: " + rule);
+
+                List<FilterType> filterTypes = parseFilterTypes(rule.getFilterType());
+                Map<String, String> filterParams = parseStringMap(rule.getFilterParams());
+
+                List<String> matchedFindings = new ArrayList<>();
+                for (String fid : findingIds) {
+                    Map<String, Object> doc = elasticsearchService.getFindingDoc(fid, tenantId);
+                    if (doc == null) continue;
+                    if (elasticsearchService.doesDocMatchFilters(doc, filterTypes, filterParams)) {
+                        matchedFindings.add(fid);
+                    }
+                }
+
+                if (matchedFindings.isEmpty()) {
+                    System.out.println("No findings matched for ruleId=" + rule.getRuleId());
+                    continue;
+                }
+                List<ActionType> actions = parseActionTypes(rule.getActionType());
+                Map<String, Object> actionParams = parseObjectMap(rule.getActionParams());
+
+                for (ActionType actionType : actions) {
+                    // The sub-object for that action, e.g. "create_ticket" => {...}
+                    // We store them in actionParams under a key matching the enum name or lowercased
+                    // So if actionType=CREATE_TICKET, we look for "create_ticket" in the map
+                    String key = actionType.name().toLowerCase(); // e.g. "create_ticket"
+                    Object subObj = actionParams.get(key);
+                    Map<String, Object> subMap = (subObj instanceof Map) ? (Map<String, Object>) subObj : new HashMap<>();
+                    System.out.println("Applying action: " + actionType + " with params: " + subMap);
+                    runbookActionService.applyAction(
+                            actionType,
+                            subMap,
+                            matchedFindings,
+                            tenantId
+                    );
+                }
+            }
+            System.out.println("Runbook processing complete");
+            sendAck(originalEventId, "SUCCESS");
+        }catch (Exception e){
+            sendAck(originalEventId, "FAIL");
+        }
+    }
+
+
+private List<FilterType> parseFilterTypes(String json) {
+    if (json == null || json.isEmpty()) return Collections.emptyList();
+    try {
+        List<String> rawList = objectMapper.readValue(json, List.class);
+        return rawList.stream()
+                .map(s -> FilterType.valueOf(s.toUpperCase()))
+                .collect(Collectors.toList());
+    } catch (Exception e) {
+        e.printStackTrace();
+        return Collections.emptyList();
+    }
+}
+
+private Map<String, String> parseStringMap(String json) {
+    if (json == null || json.isEmpty()) return Collections.emptyMap();
+    try {
+        return objectMapper.readValue(json, Map.class);
+    } catch (Exception e) {
+        e.printStackTrace();
+        return Collections.emptyMap();
+    }
+}
+
+private List<ActionType> parseActionTypes(String json) {
+    if (json == null || json.isEmpty()) return Collections.emptyList();
+    try {
+        List<String> rawList = objectMapper.readValue(json, List.class);
+        return rawList.stream()
+                .map(s -> ActionType.valueOf(s.toUpperCase()))
+                .collect(Collectors.toList());
+    } catch (Exception e) {
+        e.printStackTrace();
+        return Collections.emptyList();
+    }
+}
+
+private Map<String, Object> parseObjectMap(String json) {
+    if (json == null || json.isEmpty()) return new HashMap<>();
+    try {
+        return objectMapper.readValue(json, Map.class);
+    } catch (Exception e) {
+        e.printStackTrace();
+        return new HashMap<>();
+    }
+}
 
     private void consumeTransitionRequest(String message) throws JsonProcessingException{
         TicketTransitionRequestEvent event= objectMapper.readValue(message, TicketTransitionRequestEvent.class);
@@ -94,13 +203,9 @@ public class BgConsumer {
 
             jiraService.transitionToDone(ticketId, tenantId);
 
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "SUCCESS");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "SUCCESS");
         } catch (Exception e) {
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "FAIL");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "FAIL");
         }
 
     }
@@ -127,19 +232,13 @@ public class BgConsumer {
             // }
 
             String createdTicketKey = jiraService.createTicket(summary, description, tenantId);
-
             elasticsearchService.updateTicketId(uuid, tenantId, createdTicketKey);
-
             TenantTicket tenantTicket = new TenantTicket(tenantId, createdTicketKey, uuid);
             tenantTicketRepository.save(tenantTicket);
 
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "SUCCESS");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "SUCCESS");
         } catch (Exception e) {
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "FAIL");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "FAIL");
         }
     }
 
@@ -156,23 +255,20 @@ public class BgConsumer {
         if (optionalTenant.isEmpty()) {
             return;
         }
-
-
             githubService.updateAlert(alertNumber,tooltype, request.getState(), request.getDismissedReason(),tenantId);
             elasticsearchService.updateState(uuid,tooltype ,request.getState(), request.getDismissedReason(),tenantId);
 
-
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "SUCCESS");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "SUCCESS");
             System.out.println("sent ack from background ");
         } catch (Exception e) {
-            AcknowledgementPayload ackPayload = new AcknowledgementPayload(originalEventId, "FAIL");
-            AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
-            ackTemplate.send(ackTopic, ackEvent);
+            sendAck(originalEventId, "FAIL");
             System.out.println("sent ack from background");
         }
     }
 
-
+    private void sendAck(String eventId, String status) {
+        AcknowledgementPayload ackPayload = new AcknowledgementPayload(eventId, status);
+        AcknowledgementEvent ackEvent = new AcknowledgementEvent(null, ackPayload);
+        ackTemplate.send(ackTopic, ackEvent);
+    }
 }
